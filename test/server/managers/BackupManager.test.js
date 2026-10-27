@@ -29,8 +29,10 @@ describe('BackupManager', () => {
 
     backupManager = new BackupManager()
     backupManager.sqliteBackupStepDelayMs = 0
+    backupManager.sqliteBackupLockRetryDelayMs = 0
 
     sinon.stub(Logger, 'debug')
+    sinon.stub(Logger, 'warn')
     sinon.stub(Logger, 'error')
   })
 
@@ -94,6 +96,33 @@ describe('BackupManager', () => {
       expect(backup.currentTime).to.be.at.least(writes - 1)
     })
 
+    it('should wait for a lock held by another connection and then complete', async () => {
+      backupManager.sqliteBackupPagesPerStep = 10
+      backupManager.sqliteBackupLockRetryDelayMs = 50
+      // Shorter than the lock so the backup step fails with SQLITE_BUSY instead of waiting it out
+      await Database.sequelize.query('PRAGMA busy_timeout = 50')
+
+      // Hold an exclusive lock from a second connection, e.g. a long write transaction
+      const otherDb = new Sequelize({ dialect: 'sqlite', storage: Database.dbPath, logging: false })
+      const transaction = await otherDb.transaction({ type: Sequelize.Transaction.TYPES.EXCLUSIVE })
+      await otherDb.query('UPDATE progress SET currentTime = 100 WHERE id = 1', { transaction })
+      const releaseLock = new Promise((resolve) => setTimeout(resolve, 300)).then(() => transaction.commit())
+
+      try {
+        const backupPath = await backupManager.backupSqliteDb({ id: 'test' })
+        await releaseLock
+
+        const backup = await readBackup(backupPath)
+        expect(backup.integrity).to.equal('ok')
+        expect(backup.fillerCount).to.equal(2000)
+        expect(backup.currentTime).to.equal(100)
+        expect(Logger.warn.calledOnce).to.be.true
+      } finally {
+        await releaseLock.catch(() => {})
+        await otherDb.close()
+      }
+    })
+
     it('should leave the server db connection open', async () => {
       await backupManager.backupSqliteDb({ id: 'test' })
 
@@ -137,7 +166,7 @@ describe('BackupManager', () => {
         return error
       }
 
-      it('should retry a step when the db is busy or locked', async () => {
+      it('should retry a step when the db is busy or locked and warn once', async () => {
         stepResults = [{ error: sqliteError('SQLITE_BUSY') }, { error: sqliteError('SQLITE_LOCKED') }, { completed: true, remaining: 0 }]
 
         const backupPath = await backupManager.backupSqliteDb({ id: 'test' })
@@ -145,6 +174,7 @@ describe('BackupManager', () => {
         expect(backupPath).to.equal(Path.join(tempDir, 'absdatabase.test.sqlite'))
         expect(fakeBackup.step.callCount).to.equal(3)
         expect(fakeBackup.finish.calledOnce).to.be.true
+        expect(Logger.warn.calledOnce).to.be.true
       })
 
       it('should reject and remove the partial backup file when a step fails', async () => {
@@ -159,14 +189,13 @@ describe('BackupManager', () => {
         expect(await fs.pathExists(Path.join(tempDir, 'absdatabase.test.sqlite'))).to.be.false
       })
 
-      it('should copy the rest of the db in one step when the backup keeps restarting', async () => {
-        backupManager.sqliteBackupMaxRestarts = 2
-        stepResults = [{ remaining: 50 }, { remaining: 90 }, { remaining: 50 }, { remaining: 90 }, { completed: true, remaining: 0 }]
+      it('should keep copying in batches when the backup restarts', async () => {
+        stepResults = [{ remaining: 50 }, { remaining: 90 }, { remaining: 50 }, { remaining: 90 }, { remaining: 50 }, { completed: true, remaining: 0 }]
 
         await backupManager.backupSqliteDb({ id: 'test' })
 
         const pagesPerStep = fakeBackup.step.getCalls().map((call) => call.args[0])
-        expect(pagesPerStep).to.deep.equal([500, 500, 500, 500, -1])
+        expect(pagesPerStep).to.deep.equal([500, 500, 500, 500, 500, 500])
       })
 
       it('should reject when the backup times out', async () => {

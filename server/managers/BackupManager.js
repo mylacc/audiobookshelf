@@ -28,8 +28,8 @@ class BackupManager {
     // Sqlite db is copied in batches of pages so the db stays usable during the backup
     this.sqliteBackupPagesPerStep = 500
     this.sqliteBackupStepDelayMs = 10
+    this.sqliteBackupLockRetryDelayMs = 1000
     this.sqliteBackupTimeoutMs = 10 * 60 * 1000
-    this.sqliteBackupMaxRestarts = 3
   }
 
   get backupPath() {
@@ -415,7 +415,10 @@ class BackupManager {
    * Because the backup uses the same connection as sequelize, writes made during the backup don't wait on a lock
    * and are copied into the backup by sqlite. Stepping in batches lets queued queries run between steps.
    * Writes from a transaction use a separate connection, so sqlite restarts the backup when one commits.
-   * If that keeps happening the rest of the db is copied in one step.
+   * Steps always stay small so a long copy never holds the connection, at the cost of the backup timing out
+   * if writes from other connections keep restarting it.
+   * When another connection holds a lock the step fails right away (sqlite doesn't reset its busy counter
+   * between backup steps), so wait longer before retrying.
    *
    * @see https://www.sqlite.org/backup.html
    * @see https://github.com/TryGhost/node-sqlite3/pull/1116
@@ -437,16 +440,23 @@ class BackupManager {
       const timeoutAt = Date.now() + this.sqliteBackupTimeoutMs
       let restarts = 0
       let lastRemaining = Infinity
+      let hasLoggedLockError = false
       while (!sqliteBackup.completed) {
-        const pages = restarts >= this.sqliteBackupMaxRestarts ? -1 : this.sqliteBackupPagesPerStep
+        let delayMs = this.sqliteBackupStepDelayMs
         try {
           await new Promise((resolve, reject) => {
-            sqliteBackup.step(pages, (error) => (error ? reject(error) : resolve()))
+            sqliteBackup.step(this.sqliteBackupPagesPerStep, (error) => (error ? reject(error) : resolve()))
           })
         } catch (error) {
           // Busy and locked errors leave the backup open so the step can be retried (e.g. while a transaction is writing)
           const isLockError = error.code === 'SQLITE_BUSY' || error.code === 'SQLITE_LOCKED'
           if (!isLockError || sqliteBackup.failed) throw error
+
+          if (!hasLoggedLockError) {
+            Logger.warn(`[BackupManager] Sqlite db is locked by another connection, retrying backup step every ${this.sqliteBackupLockRetryDelayMs}ms`, error.code)
+            hasLoggedLockError = true
+          }
+          delayMs = this.sqliteBackupLockRetryDelayMs
         }
 
         if (sqliteBackup.completed) break
@@ -458,7 +468,7 @@ class BackupManager {
         if (Date.now() > timeoutAt) {
           throw new Error(`Backup timed out after ${Math.round(this.sqliteBackupTimeoutMs / 1000)}s (${sqliteBackup.remaining} of ${sqliteBackup.pageCount} pages remaining)`)
         }
-        await new Promise((resolve) => setTimeout(resolve, this.sqliteBackupStepDelayMs))
+        await new Promise((resolve) => setTimeout(resolve, delayMs))
       }
     } catch (error) {
       await new Promise((resolve) => sqliteBackup.finish(resolve))
